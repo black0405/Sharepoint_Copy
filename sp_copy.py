@@ -1,13 +1,29 @@
 """
-Copy a single file from one SharePoint location to another.
+Copy files from one SharePoint folder to another.
 
 Runs through Microsoft Graph with an Entra ID app registration (SPN):
 tenant id + client id + client secret. Same-tenant copies are done
 server-side by SharePoint -- the file's bytes never travel through this
 machine.
 
-    pip install msal requests
-    python sp_copy.py
+    pip install msal requests openpyxl
+
+Two ways to run it:
+
+    python sp_copy.py jobs.xlsx     # batch: one copy per Excel row
+    python sp_copy.py               # single file, from the constants below
+
+BATCH MODE (jobs.xlsx)
+    Row 1 holds the headers (any capitalisation):   file | source | target
+      file    name of the file to copy, e.g. report.xlsx
+      source  SharePoint link to the folder the file is in now
+      target  SharePoint link to the folder it should be copied into
+    Links may be copied from the browser address bar, from the "Copy link"
+    button, or typed as a plain path -- all three forms work. Rows with a
+    blank cell are skipped. A row that fails is reported and the run
+    continues with the next one. The SRC_* / DST_* site settings below are
+    ignored in batch mode (the links carry that information); credentials
+    and the Behaviour settings still apply.
 
 ---------------------------------------------------------------------------
 CONFIGURATION
@@ -22,11 +38,12 @@ config.env.example for the key names. Blank values are ignored.
 ---------------------------------------------------------------------------
 """
 
+import base64
 import os
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, quote, urlsplit
 
 import requests
 
@@ -414,8 +431,160 @@ def wait_for_copy(monitor_url: str, timeout: int) -> Dict[str, Any]:
     )
 
 
+def copy_item(session: requests.Session, src_drive: str, item: Dict[str, Any],
+              dst_drive: str, dst_folder_id: str, name: str) -> None:
+    """Ask SharePoint to copy one item server-side and wait for it."""
+    body: Dict[str, Any] = {
+        "parentReference": {"driveId": dst_drive, "id": dst_folder_id},
+        "name": name,
+        "@microsoft.graph.conflictBehavior":
+            "replace" if REPLACE_EXISTING else "rename",
+    }
+    response = graph_request(
+        session, "POST",
+        f"{GRAPH_ROOT}/drives/{src_drive}/items/{item['id']}/copy",
+        json=body,
+    )
+    monitor = response.headers.get("Location")
+    if monitor:
+        wait_for_copy(monitor, COPY_TIMEOUT)
+    else:
+        # Small files sometimes complete inline with a 200/201 and no monitor.
+        debug("no monitor URL returned; copy completed inline")
+
+
 # ---------------------------------------------------------------------------
-# The copy itself
+# SharePoint links -> drive items (batch mode)
+# ---------------------------------------------------------------------------
+
+def normalise_link(url: str) -> str:
+    """
+    Turn whatever SharePoint link a user pasted into one that Graph's
+    /shares endpoint understands.
+
+    Browser address-bar links (".../Forms/AllItems.aspx?id=...") point at a
+    list VIEW page, not the folder; the real folder path is in the "id"
+    (older: "RootFolder") query parameter. Sharing links (":f:/s/...") and
+    plain paths pass through, with spaces percent-encoded.
+    """
+    url = url.strip()
+    parts = urlsplit(url)
+    params = parse_qs(parts.query)
+    folder = (params.get("id") or params.get("RootFolder") or [""])[0]
+    if folder:
+        return f"{parts.scheme}://{parts.netloc}{quote(folder, safe='/')}"
+    return url.replace(" ", "%20")
+
+
+def share_token(url: str) -> str:
+    """Encode a URL the way Graph's /shares/{token} endpoint expects."""
+    raw = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii")
+    return "u!" + raw.rstrip("=")
+
+
+def resolve_folder(session: requests.Session, url: str,
+                   cache: Dict[str, Tuple[str, str]]) -> Tuple[str, str]:
+    """
+    Resolve any SharePoint folder link to (driveId, itemId). Answers are
+    cached so ten rows pointing at the same folder cost one call.
+    """
+    if url in cache:
+        return cache[url]
+    token = share_token(normalise_link(url))
+    try:
+        item = graph_get(session, f"{GRAPH_ROOT}/shares/{token}/driveItem")
+    except CopyError as exc:
+        if "(404)" in str(exc) or "(400)" in str(exc):
+            raise CopyError(
+                f"link could not be resolved (does it open in a browser?): {url}"
+            )
+        raise
+    if "folder" not in item:
+        raise CopyError(f"link points at a file, not a folder: {url}")
+    cache[url] = (item["parentReference"]["driveId"], item["id"])
+    debug(f"{url} -> drive {cache[url][0]} item {cache[url][1]}")
+    return cache[url]
+
+
+def read_jobs(path: str) -> List[Tuple[str, str, str]]:
+    """Read (file, source, target) rows from an .xlsx. Rows with blanks are skipped."""
+    try:
+        import openpyxl
+    except ImportError:
+        raise CopyError(
+            "The 'openpyxl' package is required for batch mode. Install it "
+            "with:  pip install openpyxl"
+        )
+    if not os.path.isfile(path):
+        raise CopyError(f"Excel file not found: {path}")
+
+    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = book.active.iter_rows(values_only=True)
+        header = [str(h or "").strip().lower() for h in next(rows, ())]
+        wanted = ("file", "source", "target")
+        missing = [c for c in wanted if c not in header]
+        if missing:
+            found = ", ".join(h for h in header if h) or "nothing"
+            raise CopyError(
+                f"Excel is missing column(s): {', '.join(missing)}. Row 1 "
+                f"must have the headers file, source, target (found: {found})."
+            )
+        idx = [header.index(c) for c in wanted]
+        jobs: List[Tuple[str, str, str]] = []
+        for row in rows:
+            cells = tuple(
+                str(row[i]).strip() if i < len(row) and row[i] is not None else ""
+                for i in idx
+            )
+            if all(cells):
+                jobs.append(cells)  # type: ignore[arg-type]
+        return jobs
+    finally:
+        book.close()
+
+
+def copy_from_excel(path: str) -> int:
+    """Copy every row of the workbook. Returns the number of failed rows."""
+    jobs = read_jobs(path)
+    if not jobs:
+        raise CopyError(
+            f"No usable rows in {path} (each row needs file, source and target)."
+        )
+    log(f"Jobs   : {len(jobs)} row(s) from {os.path.basename(path)}")
+
+    session = build_session()
+    folders: Dict[str, Tuple[str, str]] = {}
+    width = max(len(name) for name, _, _ in jobs)
+    failed = 0
+    for n, (name, source, target) in enumerate(jobs, 1):
+        try:
+            src_drive, src_folder = resolve_folder(session, source, folders)
+            try:
+                item = graph_get(
+                    session,
+                    f"{GRAPH_ROOT}/drives/{src_drive}/items/{src_folder}:/"
+                    f"{encode_path(name)}",
+                )
+            except CopyError as exc:
+                if "(404)" in str(exc):
+                    raise CopyError("file not found in source folder")
+                raise
+            if "file" not in item:
+                raise CopyError("that name is a folder, not a file")
+            dst_drive, dst_folder = resolve_folder(session, target, folders)
+            copy_item(session, src_drive, item, dst_drive, dst_folder, item["name"])
+            log(f"[{n}/{len(jobs)}] {name:<{width}} -> OK")
+        except (CopyError, requests.RequestException) as exc:
+            failed += 1
+            log(f"[{n}/{len(jobs)}] {name:<{width}} -> FAILED: {exc}")
+
+    log(f"Done: {len(jobs) - failed} ok, {failed} failed")
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# Single-file mode (constants / config.env)
 # ---------------------------------------------------------------------------
 
 def copy_file() -> None:
@@ -441,28 +610,8 @@ def copy_file() -> None:
         p for p in (DST_LIBRARY_NAME, DST_FOLDER.strip("/"), name) if p
     )
     log(f"Target : {target}")
-
-    body: Dict[str, Any] = {
-        "parentReference": {"driveId": dst_drive, "id": folder["id"]},
-        "name": name,
-        "@microsoft.graph.conflictBehavior":
-            "replace" if REPLACE_EXISTING else "rename",
-    }
-
-    response = graph_request(
-        session, "POST",
-        f"{GRAPH_ROOT}/drives/{src_drive}/items/{item['id']}/copy",
-        json=body,
-    )
-
-    monitor = response.headers.get("Location")
-    if monitor:
-        log("Copying (server-side)...")
-        wait_for_copy(monitor, COPY_TIMEOUT)
-    else:
-        # Small files sometimes complete inline with a 200/201 and no monitor.
-        debug("no monitor URL returned; copy completed inline")
-
+    log("Copying (server-side)...")
+    copy_item(session, src_drive, item, dst_drive, folder["id"], name)
     log("Done.")
 
 
@@ -519,7 +668,10 @@ def main() -> int:
     else:
         log(f"Config : {os.path.basename(__file__)} (no config file found)")
 
+    xlsx = next((a for a in sys.argv[1:] if a.lower().endswith(".xlsx")), None)
     try:
+        if xlsx:
+            return 1 if copy_from_excel(xlsx) else 0
         copy_file()
     except CopyError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
