@@ -61,4 +61,51 @@ with tempfile.TemporaryDirectory() as tmp:
     except sp.CopyError as exc:
         assert "source" in str(exc) and "target" in str(exc)
 
+# --- resolve_folder / folder_listing (fake Graph, no network) ---------------
+class FakeResponse:
+    def __init__(self, body, status=200):
+        self.status_code, self.ok, self.text = status, status < 400, str(body)
+        self.json = lambda: body
+
+
+class FakeSession:
+    """URL fragment -> JSON body. Anything unmatched is a 404."""
+    def __init__(self, routes):
+        self.routes = routes
+
+    def request(self, method, url, **kwargs):
+        for fragment, body in self.routes.items():
+            if fragment in url:
+                return FakeResponse(body)
+        return FakeResponse({"error": "not found"}, 404)
+
+
+site = ("t.sharepoint.com", "/sites/Fin", "")
+fake = FakeSession({
+    "/sites/t.sharepoint.com:/sites/Fin": {"id": "site1"},
+    "/sites/site1/drives": {"value": [{"name": "Documents", "id": "drv1"}]},
+    "/drives/drv1/root:/Reports/2026": {
+        "id": "fld1", "folder": {}, "parentReference": {"driveId": "drv1"}},
+    "/shares/": {
+        "id": "fld2", "folder": {}, "parentReference": {"driveId": "drv2"}},
+    "/items/fld2?$expand=children": {
+        "webUrl": "https://t/x", "children": [{"name": "b.xlsx"}, {"name": "a.xlsx"}]},
+})
+cache = {}
+# plain path -> configured site, library by name, folder by path
+assert sp.resolve_folder(fake, "Documents/Reports/2026", cache, site) == ("drv1", "fld1")
+# full link -> /shares, untouched by the site tuple
+link = "https://t.sharepoint.com/sites/Fin/Shared Documents/X"
+assert sp.resolve_folder(fake, link, cache, site) == ("drv2", "fld2")
+assert len(cache) == 2
+try:
+    sp.resolve_folder(fake, "Documents/Nope", {}, site)
+    raise AssertionError("missing plain-path folder should raise CopyError")
+except sp.CopyError as exc:
+    assert "Nope" in str(exc) and "Documents" in str(exc)
+
+listing = sp.folder_listing(fake, "drv2", "fld2")
+assert "https://t/x" in listing
+assert listing.index("a.xlsx") < listing.index("b.xlsx")   # sorted
+
 print("ok")

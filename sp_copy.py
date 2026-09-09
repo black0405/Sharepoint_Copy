@@ -18,12 +18,14 @@ BATCH MODE (jobs.xlsx)
       file    name of the file to copy, e.g. report.xlsx
       source  SharePoint link to the folder the file is in now
       target  SharePoint link to the folder it should be copied into
-    Links may be copied from the browser address bar, from the "Copy link"
-    button, or typed as a plain path -- all three forms work. Rows with a
+    Links may be copied from the browser address bar or from the "Copy
+    link" button. A cell may instead hold a plain "Library/sub/folder"
+    path (e.g. Documents/Reports/2026); that is looked up on the site
+    configured below -- SRC_SITE_* for source cells, DST_SITE_* for target
+    cells -- because a bare path carries no site of its own. Rows with a
     blank cell are skipped. A row that fails is reported and the run
-    continues with the next one. The SRC_* / DST_* site settings below are
-    ignored in batch mode (the links carry that information); credentials
-    and the Behaviour settings still apply.
+    continues with the next one. Credentials and the Behaviour settings
+    apply as usual; SRC_FILE_PATH / DST_FOLDER are ignored.
 
 ---------------------------------------------------------------------------
 CONFIGURATION
@@ -483,27 +485,64 @@ def share_token(url: str) -> str:
 
 
 def resolve_folder(session: requests.Session, url: str,
-                   cache: Dict[str, Tuple[str, str]]) -> Tuple[str, str]:
+                   cache: Dict[Any, Tuple[str, str]],
+                   site: Tuple[str, str, str]) -> Tuple[str, str]:
     """
-    Resolve any SharePoint folder link to (driveId, itemId). Answers are
-    cached so ten rows pointing at the same folder cost one call.
+    Resolve a SharePoint folder link to (driveId, itemId). A plain
+    "Library/sub/folder" cell has no host or site in it, so it is looked up
+    on `site` = (hostname, path, id) from the configuration instead.
+    Answers are cached so ten rows pointing at the same folder cost one call.
     """
-    if url in cache:
-        return cache[url]
-    token = share_token(normalise_link(url))
-    try:
-        item = graph_get(session, f"{GRAPH_ROOT}/shares/{token}/driveItem")
-    except CopyError as exc:
-        if "(404)" in str(exc) or "(400)" in str(exc):
-            raise CopyError(
-                f"link could not be resolved (does it open in a browser?): {url}"
+    key = (url, site)
+    if key in cache:
+        return cache[key]
+    if urlsplit(url).scheme:
+        token = share_token(normalise_link(url))
+        try:
+            item = graph_get(session, f"{GRAPH_ROOT}/shares/{token}/driveItem")
+        except CopyError as exc:
+            if "(404)" in str(exc) or "(400)" in str(exc):
+                raise CopyError(
+                    f"link could not be resolved (does it open in a browser?): {url}"
+                )
+            raise
+    else:
+        hostname, site_path, site_id = site
+        library, _, folder = url.strip("/").partition("/")
+        site_id = resolve_site_id(session, hostname, site_path, site_id, "batch")
+        drive = resolve_drive_id(session, site_id, library, "", "Batch")
+        try:
+            item = graph_get(
+                session, f"{GRAPH_ROOT}/drives/{drive}/root"
+                + (f":/{encode_path(folder)}" if folder else "")
             )
-        raise
+        except CopyError as exc:
+            if "(404)" in str(exc):
+                raise CopyError(
+                    f"folder '{folder}' not found in library '{library}' "
+                    f"on {hostname}{site_path}"
+                )
+            raise
     if "folder" not in item:
         raise CopyError(f"link points at a file, not a folder: {url}")
-    cache[url] = (item["parentReference"]["driveId"], item["id"])
-    debug(f"{url} -> drive {cache[url][0]} item {cache[url][1]}")
-    return cache[url]
+    cache[key] = (item["parentReference"]["driveId"], item["id"])
+    debug(f"{url} -> drive {cache[key][0]} item {cache[key][1]}")
+    return cache[key]
+
+
+def folder_listing(session: requests.Session, drive_id: str,
+                   folder_id: str) -> str:
+    """Where a folder lives and what it holds -- for 'file not found' errors."""
+    item = graph_get(
+        session, f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_id}?$expand=children"
+    )
+    # ponytail: Graph expands the first 200 children only; enough to spot a typo.
+    names = sorted(c.get("name", "?") for c in item.get("children", []))
+    shown = ", ".join(names[:20])
+    if len(names) > 20:
+        shown += f" ... and {len(names) - 20} more"
+    return (f"\n      folder  : {item.get('webUrl', '?')}"
+            f"\n      contains: {shown or '(nothing)'}")
 
 
 def read_jobs(path: str) -> List[Tuple[str, str, str]]:
@@ -554,12 +593,14 @@ def copy_from_excel(path: str) -> int:
     log(f"Jobs   : {len(jobs)} row(s) from {os.path.basename(path)}")
 
     session = build_session()
-    folders: Dict[str, Tuple[str, str]] = {}
+    src_site = (SRC_SITE_HOSTNAME, SRC_SITE_PATH, SRC_SITE_ID)
+    dst_site = (DST_SITE_HOSTNAME, DST_SITE_PATH, DST_SITE_ID)
+    folders: Dict[Any, Tuple[str, str]] = {}
     width = max(len(name) for name, _, _ in jobs)
     failed = 0
     for n, (name, source, target) in enumerate(jobs, 1):
         try:
-            src_drive, src_folder = resolve_folder(session, source, folders)
+            src_drive, src_folder = resolve_folder(session, source, folders, src_site)
             try:
                 item = graph_get(
                     session,
@@ -567,12 +608,13 @@ def copy_from_excel(path: str) -> int:
                     f"{encode_path(name)}",
                 )
             except CopyError as exc:
-                if "(404)" in str(exc):
-                    raise CopyError("file not found in source folder")
-                raise
+                if "(404)" not in str(exc):
+                    raise
+                raise CopyError("file not found in source folder"
+                                + folder_listing(session, src_drive, src_folder))
             if "file" not in item:
                 raise CopyError("that name is a folder, not a file")
-            dst_drive, dst_folder = resolve_folder(session, target, folders)
+            dst_drive, dst_folder = resolve_folder(session, target, folders, dst_site)
             copy_item(session, src_drive, item, dst_drive, dst_folder, item["name"])
             log(f"[{n}/{len(jobs)}] {name:<{width}} -> OK")
         except (CopyError, requests.RequestException) as exc:
