@@ -88,8 +88,11 @@ fake = FakeSession({
         "id": "fld1", "folder": {}, "parentReference": {"driveId": "drv1"}},
     "/shares/": {
         "id": "fld2", "folder": {}, "parentReference": {"driveId": "drv2"}},
-    "/items/fld2?$expand=children": {
-        "webUrl": "https://t/x", "children": [{"name": "b.xlsx"}, {"name": "a.xlsx"}]},
+    "/items/fld2?$select=webUrl": {"webUrl": "https://t/x"},
+    "/items/fld2/children?$top=200": {                     # page 1 of 2
+        "value": [{"name": "B.xlsx", "file": {}}],
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/drv2/items/fld2/children?$skiptoken=p2"},
+    "/items/fld2/children?$skiptoken=p2": {"value": [{"name": "a.xlsx", "file": {}}]},
 })
 cache = {}
 # plain path -> configured site, library by name, folder by path
@@ -104,8 +107,11 @@ try:
 except sp.CopyError as exc:
     assert "Nope" in str(exc) and "Documents" in str(exc)
 
-listing = sp.folder_listing(fake, "drv2", "fld2")
-assert "https://t/x" in listing
-assert listing.index("a.xlsx") < listing.index("b.xlsx")   # sorted
+listings = {}
+web_url, kids = sp.folder_children(fake, "drv2", "fld2", listings)
+assert web_url == "https://t/x"
+assert set(kids) == {"a.xlsx", "b.xlsx"}          # both pages, keyed lower-case
+assert kids["b.xlsx"]["name"] == "B.xlsx"          # original name kept for the copy
+assert sp.folder_children(fake, "drv2", "fld2", listings) is listings[("drv2", "fld2")]
 
 print("ok")

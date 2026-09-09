@@ -530,19 +530,31 @@ def resolve_folder(session: requests.Session, url: str,
     return cache[key]
 
 
-def folder_listing(session: requests.Session, drive_id: str,
-                   folder_id: str) -> str:
-    """Where a folder lives and what it holds -- for 'file not found' errors."""
-    item = graph_get(
-        session, f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_id}?$expand=children"
-    )
-    # ponytail: Graph expands the first 200 children only; enough to spot a typo.
-    names = sorted(c.get("name", "?") for c in item.get("children", []))
-    shown = ", ".join(names[:20])
-    if len(names) > 20:
-        shown += f" ... and {len(names) - 20} more"
-    return (f"\n      folder  : {item.get('webUrl', '?')}"
-            f"\n      contains: {shown or '(nothing)'}")
+def folder_children(session: requests.Session, drive_id: str, folder_id: str,
+                    cache: Dict[Any, Tuple[str, Dict[str, Dict[str, Any]]]]
+                    ) -> Tuple[str, Dict[str, Dict[str, Any]]]:
+    """
+    (webUrl, {name.lower(): item}) for a folder, following Graph's paging.
+    Cached per folder so ten files from one folder cost one listing.
+
+    Files are found by name in this listing rather than with the
+    items/{id}:/{name} path form: some tenants answer 404 to that form even
+    when the file is right there, while the id-based children listing works.
+    """
+    key = (drive_id, folder_id)
+    if key in cache:
+        return cache[key]
+    base = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_id}"
+    web_url = graph_get(session, f"{base}?$select=webUrl").get("webUrl", "?")
+    children: Dict[str, Dict[str, Any]] = {}
+    url: Optional[str] = f"{base}/children?$top=200"
+    while url:
+        page = graph_get(session, url)
+        for child in page.get("value", []):
+            children[child["name"].lower()] = child
+        url = page.get("@odata.nextLink")
+    cache[key] = (web_url, children)
+    return cache[key]
 
 
 def read_jobs(path: str) -> List[Tuple[str, str, str]]:
@@ -596,22 +608,24 @@ def copy_from_excel(path: str) -> int:
     src_site = (SRC_SITE_HOSTNAME, SRC_SITE_PATH, SRC_SITE_ID)
     dst_site = (DST_SITE_HOSTNAME, DST_SITE_PATH, DST_SITE_ID)
     folders: Dict[Any, Tuple[str, str]] = {}
+    listings: Dict[Any, Tuple[str, Dict[str, Dict[str, Any]]]] = {}
     width = max(len(name) for name, _, _ in jobs)
     failed = 0
     for n, (name, source, target) in enumerate(jobs, 1):
         try:
             src_drive, src_folder = resolve_folder(session, source, folders, src_site)
-            try:
-                item = graph_get(
-                    session,
-                    f"{GRAPH_ROOT}/drives/{src_drive}/items/{src_folder}:/"
-                    f"{encode_path(name)}",
+            web_url, children = folder_children(session, src_drive, src_folder, listings)
+            item = children.get(name.lower())
+            if item is None:
+                names = sorted(c["name"] for c in children.values())
+                shown = ", ".join(names[:20])
+                if len(names) > 20:
+                    shown += f" ... and {len(names) - 20} more"
+                raise CopyError(
+                    "file not found in source folder"
+                    f"\n      folder  : {web_url}"
+                    f"\n      contains: {shown or '(nothing)'}"
                 )
-            except CopyError as exc:
-                if "(404)" not in str(exc):
-                    raise
-                raise CopyError("file not found in source folder"
-                                + folder_listing(session, src_drive, src_folder))
             if "file" not in item:
                 raise CopyError("that name is a folder, not a file")
             dst_drive, dst_folder = resolve_folder(session, target, folders, dst_site)
