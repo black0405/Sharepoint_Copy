@@ -41,9 +41,12 @@ config.env.example for the key names. Blank values are ignored.
 """
 
 import base64
+import difflib
 import os
+import re
 import sys
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -530,11 +533,27 @@ def resolve_folder(session: requests.Session, url: str,
     return cache[key]
 
 
+_ZERO_WIDTH = re.compile("[\u200b\u200c\u200d\ufeff]")
+_SPACES = re.compile(r"\s+")
+
+
+def name_key(name: str) -> str:
+    """
+    Comparison key for a file name. Excel cells and SharePoint disagree in
+    ways the eye can't see: composed vs decomposed accents (NFC/NFD),
+    zero-width characters, non-breaking or doubled spaces, letter case.
+    Both sides of every name lookup go through this so they agree.
+    """
+    name = unicodedata.normalize("NFKC", name)
+    name = _ZERO_WIDTH.sub("", name)
+    return _SPACES.sub(" ", name).strip().casefold()
+
+
 def folder_children(session: requests.Session, drive_id: str, folder_id: str,
                     cache: Dict[Any, Tuple[str, Dict[str, Dict[str, Any]]]]
                     ) -> Tuple[str, Dict[str, Dict[str, Any]]]:
     """
-    (webUrl, {name.lower(): item}) for a folder, following Graph's paging.
+    (webUrl, {name_key(name): item}) for a folder, following Graph's paging.
     Cached per folder so ten files from one folder cost one listing.
 
     Files are found by name in this listing rather than with the
@@ -551,7 +570,7 @@ def folder_children(session: requests.Session, drive_id: str, folder_id: str,
     while url:
         page = graph_get(session, url)
         for child in page.get("value", []):
-            children[child["name"].lower()] = child
+            children[name_key(child["name"])] = child
         url = page.get("@odata.nextLink")
     cache[key] = (web_url, children)
     return cache[key]
@@ -615,16 +634,20 @@ def copy_from_excel(path: str) -> int:
         try:
             src_drive, src_folder = resolve_folder(session, source, folders, src_site)
             web_url, children = folder_children(session, src_drive, src_folder, listings)
-            item = children.get(name.lower())
+            item = children.get(name_key(name))
             if item is None:
                 names = sorted(c["name"] for c in children.values())
                 shown = ", ".join(names[:20])
                 if len(names) > 20:
                     shown += f" ... and {len(names) - 20} more"
+                close = difflib.get_close_matches(name, names, n=1, cutoff=0.6)
+                hint = (f"\n      closest : {close[0]!r}  (asked for {name!r})"
+                        if close else "")
                 raise CopyError(
                     "file not found in source folder"
                     f"\n      folder  : {web_url}"
                     f"\n      contains: {shown or '(nothing)'}"
+                    f"{hint}"
                 )
             if "file" not in item:
                 raise CopyError("that name is a folder, not a file")

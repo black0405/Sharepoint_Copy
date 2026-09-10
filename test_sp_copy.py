@@ -114,4 +114,10 @@ assert set(kids) == {"a.xlsx", "b.xlsx"}          # both pages, keyed lower-case
 assert kids["b.xlsx"]["name"] == "B.xlsx"          # original name kept for the copy
 assert sp.folder_children(fake, "drv2", "fld2", listings) is listings[("drv2", "fld2")]
 
+# --- name matching: unicode form + invisible characters ---------------------
+nfc = "Résumé 2026.xlsx"                       # e-acute composed
+nfd = "Résumé​  2026.XLSX"       # decomposed + zero-width + nbsp
+assert sp.name_key(nfc) == sp.name_key(nfd)
+assert sp.name_key("a.xlsx") != sp.name_key("ab.xlsx")
+
 print("ok")
